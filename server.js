@@ -17,40 +17,55 @@ const wss = new WebSocketServer({ server, path: "/stream" });
 
 wss.on("connection", (ws) => {
   let streamSid = null;
+  let mediaCount = 0;
 
   const interval = setInterval(() => {
-    if (ws.readyState === ws.OPEN) {
-      ws.ping();
-    }
+    if (ws.readyState === ws.OPEN) ws.ping();
   }, 25000);
 
-  ws.on("message", (data) => {
+  ws.on("message", (raw) => {
+    const s = raw.toString();
+
     let msg;
     try {
-      msg = JSON.parse(data.toString());
-    } catch {
+      msg = JSON.parse(s);
+    } catch (e) {
+      console.log("PARSE ERROR:", e.message);
+      console.log("RAW:", s);
       return;
     }
+
+    console.log("EVENT:", msg.event);
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid;
       console.log("[start]", streamSid);
+      return;
+    }
+
+    if (msg.event === "media") {
+      mediaCount++;
+      if (mediaCount % 50 === 0) {
+        console.log("MEDIA FRAMES:", streamSid, mediaCount);
+      }
+      return;
     }
 
     if (msg.event === "stop") {
       console.log("[stop]", streamSid);
       ws.close();
+      return;
     }
   });
 
-  ws.on("close", () => {
+  ws.on("close", (code, reason) => {
     clearInterval(interval);
-    console.log("[ws closed]", streamSid);
+    console.log("CLOSED:", streamSid, code, reason?.toString?.() || "");
   });
 
   ws.on("error", (err) => {
     clearInterval(interval);
-    console.log("[ws error]", err.message);
+    console.log("WS ERROR:", streamSid, err.message);
   });
 });
 
