@@ -7,11 +7,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@fastify/formbody": "^8.0.0",
-    "@fastify/websocket": "^11.0.0",
-    "@openai/agents": "^0.0.0",
-    "@openai/agents-extensions": "^0.0.0",
-    "dotenv": "^16.4.5",
-    "fastify": "^4.28.1"
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
