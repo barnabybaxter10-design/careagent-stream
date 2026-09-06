@@ -3,6 +3,12 @@
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "ws": "^8.18.0" }
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test server.test.js"
+  },
+  "dependencies": {
+    "twilio": "6.1.0",
+    "ws": "8.18.3"
+  }
 }
