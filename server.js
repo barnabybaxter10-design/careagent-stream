@@ -117,12 +117,17 @@ export async function endTwilioCall(meta, config, { fetchImpl = fetch } = {}) {
   if (!/^CA[0-9a-f]{32}$/i.test(meta.callSid) || !/^AC[0-9a-f]{32}$/i.test(config.twilioAccountSid || "")) {
     return { ok: false, status: null };
   }
+  const name = agencyName(meta.agency_name);
+  const goodbye = new twilio.twiml.VoiceResponse();
+  goodbye.say({ voice: "Polly.Brian", language: "en-GB" },
+    `Thank you for calling${name ? ` ${name}` : ""}. Take care, and goodbye.`);
+  goodbye.hangup();
   const response = await fetchImpl(`https://api.twilio.com/2010-04-01/Accounts/${config.twilioAccountSid}/Calls/${meta.callSid}.json`, {
     method: "POST", redirect: "error", signal: AbortSignal.timeout(5000),
     headers: { Authorization: `Basic ${Buffer.from(`${config.twilioAccountSid}:${config.twilioToken}`).toString("base64")}`,
       "Content-Type": "application/x-www-form-urlencoded" },
     // Replacing TwiML avoids the post-Stream fallback and gives a deterministic ending.
-    body: new URLSearchParams({ Twiml: '<Response><Say voice="Polly.Brian" language="en-GB">Thank you for calling. Goodbye.</Say><Hangup/></Response>' }).toString(),
+    body: new URLSearchParams({ Twiml: goodbye.toString() }).toString(),
   });
   await response.body?.cancel();
   return { ok: response.ok, status: response.status };
