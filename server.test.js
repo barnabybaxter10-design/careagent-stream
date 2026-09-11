@@ -395,10 +395,16 @@ test("Twilio goodbye request is scoped, bounded and cannot redirect credentials"
   assert.ok(requests[0].options.signal instanceof AbortSignal);
   const twiml = new URLSearchParams(requests[0].options.body).get("Twiml");
   assert.match(twiml, /language="en-GB"/);
-  assert.match(twiml, /Goodbye.<\/Say><Hangup\/>/);
+  assert.match(twiml, /Thank you for calling\. Take care, and goodbye\.<\/Say><Hangup\/>/);
   assert.ok(!twiml.includes("Redirect"));
   await endTwilioCall({ callSid: "../../other-account" }, config, { fetchImpl: async () => { throw new Error("Must not fetch"); } });
   assert.equal(requests.length, 1);
+  await endTwilioCall({ ...meta, agency_name: "Oak & Elm Care" }, config, { fetchImpl: async (url, options) => {
+    const agencyTwiml = new URLSearchParams(options.body).get("Twiml");
+    assert.match(agencyTwiml, /Thank you for calling Oak &amp; Elm Care\. Take care, and goodbye\.<\/Say><Hangup\/>/);
+    assert.equal((agencyTwiml.match(/<Say /g) || []).length, 1);
+    return new Response(null, { status: 200 });
+  } });
 });
 
 const preparedMeta = { callSid: `CA${"a".repeat(32)}`, agency_id: "agency-a", from: "+447000000001",
