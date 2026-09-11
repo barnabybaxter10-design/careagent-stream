@@ -3,7 +3,8 @@ import { EventEmitter, once } from "node:events";
 import { test } from "node:test";
 import { WebSocket } from "ws";
 import twilio from "twilio";
-import { createBridge, postCallReport } from "./server.js";
+import { createBridge, postCallReport, configFromEnv } from "./server.js";
+import { liveSessionStart, renderLiveTranscript } from "./live.js";
 
 const config = {
   apiKey: "local-test", model: "gpt-realtime-2025-08-28", prompt: "Local test instructions",
@@ -163,4 +164,86 @@ test("permanent report rejection is reported without pointless retries", async (
   } });
   assert.equal(result.ok, false);
   assert.equal(calls, 1);
+});
+
+const liveConfig = { ...config, voiceApi: "live", liveModel: "gpt-live-1", liveVoice: "marin", backendModel: "gpt-5.6-luna" };
+
+test("Live defaults preserve agency guidance without inventing tool execution", () => {
+  const settings = configFromEnv({ CAREGENIE_SYSTEM_PROMPT: "Agency policy" });
+  const session = liveSessionStart(settings).session;
+  assert.equal(settings.voiceApi, "live");
+  assert.equal(session.model, "gpt-live-1");
+  assert.equal(session.store, false);
+  assert.deepEqual(session.audio.format, { type: "audio/pcmu", rate: 8000 });
+  assert.match(session.delegation.responses.instructions, /Agency policy/);
+  assert.match(session.delegation.responses.instructions, /Do not call or simulate save_call_report/);
+  assert.equal(session.delegation.responses.tool_choice, "none");
+});
+
+test("Live streams paced PCMU, handles greeting acknowledgment and final late transcripts", async t => {
+  const f = await fixture(t, { config: liveConfig, liveCloseMs: 300 });
+  const ws = await f.connect(), received = [];
+  ws.on("message", raw => received.push(JSON.parse(raw)));
+  ws.send(JSON.stringify(start));
+  const payload = Buffer.alloc(160, 255).toString("base64");
+  for (let i = 0; i < 3; i++) ws.send(JSON.stringify({ event: "media", media: { payload } }));
+  await until(() => f.upstreams.length);
+  const ai = f.upstreams[0]; ai.open();
+  assert.equal(ai.sent[0].type, "session.start");
+  assert.equal(ai.sent.length, 1);
+  ai.message({ type: "session.started", event_id: "started" });
+  assert.equal(ai.sent.filter(e => e.type === "session.input_audio.append").length, 1, "startup queue is paced");
+  assert.equal(ai.sent.filter(e => e.type === "session.commentary.append").length, 0);
+  ai.message({ type: "session.instructions.appended", client_event_id: "other" });
+  assert.equal(ai.sent.filter(e => e.type === "session.commentary.append").length, 0);
+  ai.message({ type: "session.instructions.appended", client_event_id: "care_greeting" });
+  assert.equal(ai.sent.filter(e => e.type === "session.commentary.append").length, 1);
+  ai.message({ type: "session.output_audio.delta", delta: payload });
+  const fragment = { type: "session.input_transcript.delta", event_id: "u1", delta: "The carer", start_ms: 100, end_ms: 400 };
+  ai.message(fragment); ai.message(fragment);
+  ai.message({ type: "session.output_transcript.delta", event_id: "a1", delta: "I’m listening.", start_ms: 200, end_ms: 450 });
+  ai.message({ type: "response.event", event: { type: "response.output_text.delta", delta: "INTERNAL BACKEND TEXT" } });
+  ai.message({ type: "session.usage.updated", usage: { seconds: 10 } });
+  ai.message({ type: "session.usage.updated", usage: { seconds: 12 } });
+  ws.send(JSON.stringify({ event: "stop" }));
+  await until(() => ai.sent.some(e => e.type === "session.close"));
+  assert.equal(ai.sent.filter(e => e.type === "session.input_audio.append").length, 3);
+  assert.equal(f.reports.length, 0, "wait for finalization, not a fixed transcript sleep");
+  ai.message({ type: "session.input_transcript.delta", event_id: "u2", delta: " has not arrived.", start_ms: 400, end_ms: 650 });
+  ai.message({ type: "session.closed", reason: "close_requested", usage: { seconds: 13 } });
+  await until(() => f.reports.length === 1);
+  assert.equal(f.reports[0].transcript, "Caller: The carer has not arrived.\nAssistant: I’m listening.");
+  assert.equal(f.reports[0].reason, "twilio_stop");
+  assert.equal(f.reports[0].urgency, undefined);
+  assert.deepEqual(received[0], { event: "media", streamSid: "MZ-test", media: { payload } });
+  assert.ok(!ai.sent.some(e => ["response.create", "input_audio_buffer.commit", "session.update"].includes(e.type)));
+  ai.close(); ws.close();
+  assert.equal(f.reports.length, 1);
+});
+
+for (const failure of ["transport", "timeout", "backend"]) {
+  test(`Live ${failure} failure creates exactly one urgent report`, async t => {
+    const f = await fixture(t, { config: liveConfig, liveCloseMs: 30 });
+    const ws = await f.connect(); ws.send(JSON.stringify(start));
+    await until(() => f.upstreams.length);
+    const ai = f.upstreams[0]; ai.open(); ai.message({ type: "session.started" });
+    ai.message({ type: "session.instructions.appended", client_event_id: "care_greeting" });
+    ai.message({ type: "session.input_transcript.delta", delta: "Hello", start_ms: 0, end_ms: 200 });
+    if (failure === "transport") ai.close();
+    else if (failure === "backend") ai.message({ type: "response.event", event: { type: "response.failed" } });
+    else ws.send(JSON.stringify({ event: "stop" }));
+    await until(() => f.reports.length);
+    assert.equal(f.reports[0].urgency, "urgent");
+    ai.close(); ws.close();
+    assert.equal(f.reports.length, 1);
+  });
+}
+
+test("Live late overlapping transcript fragments retain spaces and repeated words", () => {
+  assert.equal(renderLiveTranscript([
+    { role: "Caller", text: " no", start: 200, end: 300, order: 0 },
+    { role: "Assistant", text: "Okay.", start: 100, end: 300, order: 1 },
+    { role: "Caller", text: "No,", start: 0, end: 200, order: 2 },
+    { role: "Caller", text: "More.", start: 5000, end: 5500, order: 3 },
+  ]), "Caller: No, no\nAssistant: Okay.\nCaller: More.");
 });
