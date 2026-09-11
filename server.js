@@ -4,7 +4,8 @@ import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import twilio from "twilio";
 import { WebSocketServer, WebSocket } from "ws";
-import { connectLive, liveSessionStart, liveGreeting, renderLiveTranscript } from "./live.js";
+import { connectLive, liveSessionStart, liveGreeting, renderLiveTranscript,
+  isDigitalSilence, nextAudioDeadline } from "./live.js";
 
 const send = (ws, value) => {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(value));
@@ -150,6 +151,10 @@ export function createBridge({
     let uncertain = false;
     let endingReason, liveFinalized = false, closeRequested = false, greetingAccepted = false;
     let usageSeconds = null;
+    let nextAudioAt = null, startupMs = null, firstOutputMs = null, trimmedSilenceMs = 0;
+    let maxInputQueueMs = 0, lastInputQueueMs = 0, outputSinceMark = 0, markSequence = 0;
+    let lastPlaybackAckMs = null, maxPlaybackAckMs = 0;
+    const playbackMarks = new Map();
     const liveFragments = [], liveEventIds = new Set();
     const transcripts = new Map();
     const pendingTranscripts = new Set();
@@ -166,6 +171,7 @@ export function createBridge({
         queuedBytes += Buffer.from(payload, "base64").length;
         if (queuedBytes > 8000 * 5) { finish("audio_buffer_overflow", false); return; }
         audioQueue.push(payload);
+        maxInputQueueMs = Math.max(maxInputQueueMs, queuedBytes / 8);
         pumpLiveAudio();
         return;
       }
@@ -183,12 +189,14 @@ export function createBridge({
     function pumpLiveAudio() {
       if (audioTimer || !ready || reported || closeRequested) return;
       const payload = audioQueue.shift();
-      if (!payload) { if (ending) requestLiveClose(); return; }
+      if (!payload) { nextAudioAt = null; if (ending) requestLiveClose(); return; }
       const bytes = Buffer.from(payload, "base64").length;
       queuedBytes -= bytes;
+      lastInputQueueMs = queuedBytes / 8;
+      nextAudioAt = nextAudioDeadline(nextAudioAt, bytes, performance.now());
       send(openaiWs, { type: "session.input_audio.append", audio: payload });
       // Startup audio must not be burst into Live faster than its sample rate.
-      audioTimer = setTimeout(() => { audioTimer = null; pumpLiveAudio(); }, Math.max(1, bytes / 8));
+      audioTimer = setTimeout(() => { audioTimer = null; pumpLiveAudio(); }, Math.max(1, nextAudioAt - performance.now()));
     }
     async function complete(reason) {
       if (reported) return;
@@ -213,7 +221,10 @@ export function createBridge({
         payload.urgency = "urgent";
       }
       if (live) logger.info(JSON.stringify({ event: "live_session_end", callSid: meta.callSid,
-        finalized: liveFinalized, usage_seconds: usageSeconds }));
+        finalized: liveFinalized, usage_seconds: usageSeconds, startup_ms: startupMs,
+        first_output_ms: firstOutputMs, trimmed_startup_silence_ms: trimmedSilenceMs,
+        max_input_queue_ms: maxInputQueueMs, last_input_queue_ms: lastInputQueueMs,
+        last_playback_ack_ms: lastPlaybackAckMs, max_playback_ack_ms: maxPlaybackAckMs }));
       try {
         const result = await report(payload);
         (result?.ok ? logger.info : logger.error).call(logger,
@@ -250,6 +261,13 @@ export function createBridge({
           if (msg.event_id) liveEventIds.add(msg.event_id);
           if (msg.type === "session.started" && !ready && !ending) {
             ready = true; clearTimeout(setupTimer);
+            startupMs = Date.now() - startedAt;
+            // Retaining old startup silence makes every later utterance late.
+            // Preserve all non-silent audio and one final frame to keep input flowing.
+            while (audioQueue.length > 1 && isDigitalSilence(audioQueue[0])) {
+              const bytes = Buffer.from(audioQueue.shift(), "base64").length;
+              queuedBytes -= bytes; trimmedSilenceMs += bytes / 8;
+            }
             send(openaiWs, liveGreeting());
             setupTimer = setTimeout(() => finish("live_greeting_timeout", false), setupMs);
             pumpLiveAudio();
@@ -265,7 +283,15 @@ export function createBridge({
               end: Number.isFinite(msg.end_ms) ? msg.end_ms : Date.now() - startedAt, order: liveFragments.length });
           }
           if (msg.type === "session.output_audio.delta" && msg.delta && !ending) {
+            firstOutputMs ??= Date.now() - startedAt;
             send(twilioWs, { event: "media", streamSid, media: { payload: msg.delta } });
+            outputSinceMark += Buffer.from(msg.delta, "base64").length;
+            if (outputSinceMark >= 1600) {
+              const name = `live_audio_${++markSequence}`;
+              playbackMarks.set(name, performance.now()); outputSinceMark = 0;
+              if (playbackMarks.size > 500) playbackMarks.delete(playbackMarks.keys().next().value);
+              send(twilioWs, { event: "mark", streamSid, mark: { name } });
+            }
           }
           if (msg.type === "session.usage.updated" || msg.type === "session.closed") {
             if (Number.isFinite(msg.usage?.seconds)) usageSeconds = msg.usage.seconds;
@@ -335,6 +361,11 @@ export function createBridge({
     twilioWs.on("message", raw => {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { finish("invalid_message", false); return; }
+      if (msg.event === "mark" && playbackMarks.has(msg.mark?.name)) {
+        lastPlaybackAckMs = Math.round(performance.now() - playbackMarks.get(msg.mark.name));
+        maxPlaybackAckMs = Math.max(maxPlaybackAckMs, lastPlaybackAckMs);
+        playbackMarks.delete(msg.mark.name);
+      }
       if (ending) return;
       if (msg.event === "start") {
         if (meta) { finish("duplicate_start", false); return; }
@@ -355,6 +386,7 @@ export function createBridge({
         if (ready) appendAudio(msg.media.payload);
         else {
           queuedBytes += Buffer.from(msg.media.payload, "base64").length;
+          maxInputQueueMs = Math.max(maxInputQueueMs, queuedBytes / 8);
           if (queuedBytes > 8000 * 5) { finish("audio_buffer_overflow", false); return; }
           audioQueue.push(msg.media.payload);
         }
