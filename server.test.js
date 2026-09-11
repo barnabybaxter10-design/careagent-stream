@@ -3,13 +3,15 @@ import { EventEmitter, once } from "node:events";
 import { test } from "node:test";
 import { WebSocket } from "ws";
 import twilio from "twilio";
-import { createBridge, postCallReport, configFromEnv } from "./server.js";
-import { liveSessionStart, renderLiveTranscript, isDigitalSilence, nextAudioDeadline } from "./live.js";
+import { createBridge, postCallReport, configFromEnv, endTwilioCall } from "./server.js";
+import { liveSessionStart, liveGreeting, renderLiveTranscript, isDigitalSilence, nextAudioDeadline,
+  validEndCallArguments } from "./live.js";
 
 const config = {
   apiKey: "local-test", model: "gpt-realtime-2025-08-28", prompt: "Local test instructions",
   voice: "ballad", transcriptionModel: "whisper-1", reportUrl: "https://app.example/api/webhooks/calls/report",
   reportSecret: "local-report", twilioToken: "local-twilio", streamUrl: "wss://bridge.example/stream",
+  twilioAccountSid: `AC${"0".repeat(32)}`,
 };
 const start = { event: "start", start: {
   callSid: "CA-test", streamSid: "MZ-test",
@@ -177,7 +179,12 @@ test("Live defaults preserve agency guidance without inventing tool execution", 
   assert.deepEqual(session.audio.format, { type: "audio/pcmu", rate: 8000 });
   assert.match(session.delegation.responses.instructions, /Agency policy/);
   assert.match(session.delegation.responses.instructions, /Do not call or simulate save_call_report/);
-  assert.equal(session.delegation.responses.tool_choice, "none");
+  assert.equal(session.audio.output.voice, "vesper");
+  assert.equal(session.delegation.responses.tool_choice, "auto");
+  assert.deepEqual(session.delegation.responses.tools.map(t => t.name), ["end_call"]);
+  assert.match(liveGreeting().content, /CareGenie. How can I help/);
+  assert.ok(!liveGreeting().content.includes("I’m an AI"));
+  assert.match(session.instructions, /honestly explain/);
 });
 
 test("Live streams paced PCMU, handles greeting acknowledgment and final late transcripts", async t => {
@@ -290,4 +297,106 @@ test("startup silence is trimmed without dropping caller speech or later pauses"
   assert.equal(metrics.last_input_queue_ms, 0);
   assert.ok(metrics.last_playback_ack_ms >= 0);
   assert.ok(!JSON.stringify(metrics).includes(speech), "timing logs contain no audio or transcript");
+});
+
+function requestEndCall(ai, { quote = "No, that's everything.", delegation = "delegation_end", completed = true } = {}) {
+  ai.message({ type: "response.event", delegation_id: delegation, event: { type: "response.created", response: { id: "response_end" } } });
+  ai.message({ type: "response.event", delegation_id: delegation, event: { type: "response.output_item.done", item: {
+    type: "function_call", call_id: "end_1", name: "end_call",
+    arguments: JSON.stringify({ reason: "intake_finished", caller_confirmation: quote }),
+  } } });
+  if (completed) ai.message({ type: "response.event", delegation_id: delegation, event: { type: "response.completed", response: { output: [] } } });
+}
+
+async function closingFixture(t, extra = {}) {
+  const calls = [];
+  const f = await fixture(t, { config: liveConfig, endCallGraceMs: 35, liveCloseMs: 100,
+    endCall: async meta => { calls.push(meta); return { ok: true, status: 200 }; }, ...extra });
+  const ws = await f.connect(); ws.send(JSON.stringify(start));
+  await until(() => f.upstreams.length);
+  const ai = f.upstreams[0]; ai.open(); ai.message({ type: "session.started" });
+  ai.message({ type: "session.instructions.appended", client_event_id: "care_greeting" });
+  ai.message({ type: "session.input_transcript.delta", delta: "No, that's everything.", start_ms: 1000, end_ms: 1500 });
+  return { ...f, ai, ws, calls };
+}
+
+test("end call quotes must match the whole latest caller utterance", () => {
+  assert.equal(validEndCallArguments({ reason: "caller_goodbye", caller_confirmation: "Goodbye" }, "Goodbye."), true);
+  assert.equal(validEndCallArguments({ reason: "caller_goodbye", caller_confirmation: "Goodbye" }, "Goodbye? No, wait, I need help."), false);
+  assert.equal(validEndCallArguments({ reason: "silence", caller_confirmation: "No" }, "No"), false);
+  assert.equal(validEndCallArguments({ reason: "intake_finished", caller_confirmation: "" }, ""), false);
+});
+
+test("confirmed end waits for completed tool response, replaces only current call and reports once", async t => {
+  const f = await closingFixture(t);
+  requestEndCall(f.ai, { completed: false });
+  await new Promise(resolve => setTimeout(resolve, 45));
+  assert.equal(f.calls.length, 0, "do not execute partially streamed tool calls");
+  f.ai.message({ type: "response.event", delegation_id: "delegation_end", event: { type: "response.completed", response: { output: [] } } });
+  await until(() => f.calls.length);
+  assert.equal(f.calls[0].callSid, start.start.callSid);
+  await until(() => f.ai.sent.some(e => e.type === "session.close"));
+  f.ai.message({ type: "session.input_transcript.delta", delta: " Bye.", start_ms: 1500, end_ms: 1600 });
+  f.ai.message({ type: "session.closed", reason: "close_requested" });
+  await until(() => f.reports.length);
+  assert.equal(f.reports[0].reason, "conversation_complete");
+  assert.equal(f.reports[0].urgency, undefined);
+  assert.match(f.reports[0].transcript, /Bye/);
+  requestEndCall(f.ai);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.reports.length, 1);
+});
+
+test("new caller details during closing grace cancel the hangup", async t => {
+  const f = await closingFixture(t);
+  requestEndCall(f.ai);
+  f.ai.message({ type: "session.input_transcript.delta", delta: "Actually, wait. I need help.", start_ms: 3000, end_ms: 3400 });
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.ws.readyState, WebSocket.OPEN);
+  assert.ok(f.ai.sent.some(e => e.content?.includes("hangup is cancelled")));
+  f.ws.send(JSON.stringify({ event: "stop" }));
+  await until(() => f.ai.sent.some(e => e.type === "session.close"));
+  f.ai.message({ type: "session.closed", reason: "close_requested" });
+});
+
+test("an old confirmation cannot end a call after the caller changes their mind", async t => {
+  const f = await closingFixture(t);
+  requestEndCall(f.ai, { completed: false });
+  f.ai.message({ type: "session.input_transcript.delta", delta: "Please stay on the line.", start_ms: 3000, end_ms: 3400 });
+  f.ai.message({ type: "response.event", delegation_id: "delegation_end", event: { type: "response.completed" } });
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(f.calls.length, 0);
+  assert.ok(f.ai.sent.some(e => e.item?.output?.includes("rejected_stale")));
+  f.ws.send(JSON.stringify({ event: "stop" }));
+  await until(() => f.ai.sent.some(e => e.type === "session.close"));
+  f.ai.message({ type: "session.closed", reason: "close_requested" });
+});
+
+test("Twilio call-ending rejection leaves the conversation connected", async t => {
+  const f = await closingFixture(t, { endCall: async () => ({ ok: false, status: 503 }) });
+  requestEndCall(f.ai);
+  await until(() => f.ai.sent.some(e => e.content?.includes("call-ending action failed")));
+  assert.equal(f.ws.readyState, WebSocket.OPEN);
+  assert.equal(f.reports.length, 0);
+  f.ws.send(JSON.stringify({ event: "stop" }));
+  await until(() => f.ai.sent.some(e => e.type === "session.close"));
+  f.ai.message({ type: "session.closed", reason: "close_requested" });
+});
+
+test("Twilio goodbye request is scoped, bounded and cannot redirect credentials", async () => {
+  const requests = [], meta = { callSid: `CA${"1".repeat(32)}` };
+  const result = await endTwilioCall(meta, config, { fetchImpl: async (url, options) => {
+    requests.push({ url, options }); return new Response(null, { status: 200 });
+  } });
+  assert.equal(result.ok, true);
+  assert.ok(requests[0].url.endsWith(`/Calls/${meta.callSid}.json`));
+  assert.equal(requests[0].options.redirect, "error");
+  assert.ok(requests[0].options.signal instanceof AbortSignal);
+  const twiml = new URLSearchParams(requests[0].options.body).get("Twiml");
+  assert.match(twiml, /language="en-GB"/);
+  assert.match(twiml, /Goodbye.<\/Say><Hangup\/>/);
+  assert.ok(!twiml.includes("Redirect"));
+  await endTwilioCall({ callSid: "../../other-account" }, config, { fetchImpl: async () => { throw new Error("Must not fetch"); } });
+  assert.equal(requests.length, 1);
 });

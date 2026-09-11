@@ -5,7 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import twilio from "twilio";
 import { WebSocketServer, WebSocket } from "ws";
 import { connectLive, liveSessionStart, liveGreeting, renderLiveTranscript,
-  isDigitalSilence, nextAudioDeadline } from "./live.js";
+  isDigitalSilence, nextAudioDeadline, latestCallerUtterance, validEndCallArguments } from "./live.js";
 
 const send = (ws, value) => {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(value));
@@ -16,7 +16,7 @@ export function configFromEnv(env = process.env) {
     apiKey: env.OPENAI_API_KEY || "",
     voiceApi: env.OPENAI_VOICE_API || "live",
     liveModel: env.OPENAI_LIVE_MODEL || "gpt-live-1",
-    liveVoice: env.OPENAI_LIVE_VOICE || "marin",
+    liveVoice: env.OPENAI_LIVE_VOICE || "vesper",
     backendModel: env.OPENAI_LIVE_BACKEND_MODEL || "gpt-5.6-luna",
     model: env.OPENAI_REALTIME_MODEL || "gpt-realtime-2025-08-28",
     prompt: env.CAREGENIE_SYSTEM_PROMPT || "",
@@ -25,6 +25,7 @@ export function configFromEnv(env = process.env) {
     reportUrl: env.CALL_REPORT_URL || "",
     reportSecret: env.CALL_REPORT_SECRET || "",
     twilioToken: env.TWILIO_AUTH_TOKEN || "",
+    twilioAccountSid: env.TWILIO_ACCOUNT_SID || "",
     streamUrl: env.TWILIO_STREAM_WSS_URL ||
       (env.RAILWAY_PUBLIC_DOMAIN ? `wss://${env.RAILWAY_PUBLIC_DOMAIN}/stream` : ""),
   };
@@ -37,6 +38,7 @@ export function missingConfiguration(config) {
   };
   const missing = Object.keys(fields).filter(key => !fields[key]);
   if (config.voiceApi && !["live", "realtime"].includes(config.voiceApi)) missing.push("OPENAI_VOICE_API");
+  if (config.voiceApi === "live" && !/^AC[0-9a-f]{32}$/i.test(config.twilioAccountSid || "")) missing.push("TWILIO_ACCOUNT_SID");
   for (const [name, value, protocol] of [
     ["CALL_REPORT_URL", config.reportUrl, "https:"],
     ["TWILIO_STREAM_WSS_URL", config.streamUrl, "wss:"],
@@ -108,6 +110,22 @@ export async function postCallReport(payload, config, {
   return { ok: false, status, attempts };
 }
 
+export async function endTwilioCall(meta, config, { fetchImpl = fetch } = {}) {
+  // IDs come from the authenticated stream/configuration, never model arguments.
+  if (!/^CA[0-9a-f]{32}$/i.test(meta.callSid) || !/^AC[0-9a-f]{32}$/i.test(config.twilioAccountSid || "")) {
+    return { ok: false, status: null };
+  }
+  const response = await fetchImpl(`https://api.twilio.com/2010-04-01/Accounts/${config.twilioAccountSid}/Calls/${meta.callSid}.json`, {
+    method: "POST", redirect: "error", signal: AbortSignal.timeout(5000),
+    headers: { Authorization: `Basic ${Buffer.from(`${config.twilioAccountSid}:${config.twilioToken}`).toString("base64")}`,
+      "Content-Type": "application/x-www-form-urlencoded" },
+    // Replacing TwiML avoids the post-Stream fallback and gives a deterministic ending.
+    body: new URLSearchParams({ Twiml: '<Response><Say voice="Polly.Brian" language="en-GB">Thank you for calling. Goodbye.</Say><Hangup/></Response>' }).toString(),
+  });
+  await response.body?.cancel();
+  return { ok: response.ok, status: response.status };
+}
+
 export function createBridge({
   config = configFromEnv(),
   connectOpenAI = () => config.voiceApi === "live" ? connectLive(config) : new WebSocket(
@@ -115,10 +133,12 @@ export function createBridge({
     { headers: { Authorization: `Bearer ${config.apiKey}` }, handshakeTimeout: 10000 }
   ),
   report = payload => postCallReport(payload, config),
+  endCall = meta => endTwilioCall(meta, config),
   logger = console,
   drainMs = 2000,
   setupMs = 10000,
   liveCloseMs = 15000,
+  endCallGraceMs = 750,
 } = {}) {
   const live = config.voiceApi === "live";
   const missing = missingConfiguration(config);
@@ -154,6 +174,9 @@ export function createBridge({
     let nextAudioAt = null, startupMs = null, firstOutputMs = null, trimmedSilenceMs = 0;
     let maxInputQueueMs = 0, lastInputQueueMs = 0, outputSinceMark = 0, markSequence = 0;
     let lastPlaybackAckMs = null, maxPlaybackAckMs = 0;
+    let callerVersion = 0, endCallTimer, endCallPending = false, endCallSucceeded = false;
+    let delegationCount = 0, lastCallerEndMs = null;
+    const responseCallerVersions = new Map(), responseTools = new Map(), handledTools = new Set(), responseGaps = [];
     const playbackMarks = new Map();
     const liveFragments = [], liveEventIds = new Set();
     const transcripts = new Map();
@@ -165,6 +188,54 @@ export function createBridge({
     function closeSocket(ws) {
       if (ws?.readyState === WebSocket.OPEN) ws.close(1000);
       else if (ws?.readyState === WebSocket.CONNECTING) ws.terminate();
+    }
+    function toolResult(callId, status) {
+      send(openaiWs, { type: "response.item.create", item: {
+        type: "function_call_output", call_id: callId, output: JSON.stringify({ status }),
+      } });
+    }
+    function handleEndCall(msg) {
+      const item = msg.event?.item;
+      if (msg.event?.type !== "response.output_item.done" || item?.type !== "function_call" ||
+          !item.call_id || handledTools.has(item.call_id) || ending) return false;
+      handledTools.add(item.call_id);
+      if (item.name !== "end_call") { toolResult(item.call_id, "unknown_tool"); return true; }
+      let args;
+      try { args = JSON.parse(item.arguments); } catch { toolResult(item.call_id, "invalid_arguments"); return true; }
+      if (endCallPending || responseCallerVersions.get(msg.delegation_id) !== callerVersion ||
+          !validEndCallArguments(args, latestCallerUtterance(liveFragments))) {
+        toolResult(item.call_id, "rejected_stale_or_unconfirmed"); return true;
+      }
+      endCallPending = true;
+      const version = callerVersion;
+      toolResult(item.call_id, "scheduled_goodbye_and_hangup");
+      endCallTimer = setTimeout(async () => {
+        endCallTimer = null;
+        if (ending || version !== callerVersion) { endCallPending = false; return; }
+        // Keep both sockets alive until Twilio accepts the replacement. Failure must
+        // leave the caller connected, never trigger the fallback by closing a stream.
+        try {
+          const result = await endCall(meta);
+          endCallSucceeded = result?.ok === true;
+          logger.info(JSON.stringify({ event: "call_end_request", callSid: meta.callSid,
+            ok: endCallSucceeded, status: result?.status ?? null }));
+          if (endCallSucceeded) {
+            endingReason = "conversation_complete";
+            // Twilio will send stop/close when it switches to the goodbye TwiML.
+            if (!ending) finish("conversation_complete");
+          } else if (!ending) {
+            endCallPending = false;
+            send(openaiWs, { type: "session.instructions.append", delegation_id: null,
+              content: "The call-ending action failed. Remain available; if the caller is finished, tell them they may hang up. Do not claim the call was ended." });
+          }
+        } catch {
+          endCallPending = false;
+          logger.error(JSON.stringify({ event: "call_end_request", callSid: meta.callSid, ok: false }));
+          if (!ending) send(openaiWs, { type: "session.instructions.append", delegation_id: null,
+            content: "The call-ending action could not be confirmed. If still connected and finished, the caller may hang up. Do not claim success." });
+        }
+      }, endCallGraceMs);
+      return true;
     }
     function appendAudio(payload) {
       if (live) {
@@ -203,6 +274,7 @@ export function createBridge({
       reported = true;
       clearTimeout(drainTimer); clearTimeout(setupTimer);
       clearTimeout(audioTimer);
+      clearTimeout(endCallTimer);
       clearTimeout(maxDurationTimer); clearInterval(ping);
       closeSocket(openaiWs); closeSocket(twilioWs);
       if (!meta) return;
@@ -224,7 +296,9 @@ export function createBridge({
         finalized: liveFinalized, usage_seconds: usageSeconds, startup_ms: startupMs,
         first_output_ms: firstOutputMs, trimmed_startup_silence_ms: trimmedSilenceMs,
         max_input_queue_ms: maxInputQueueMs, last_input_queue_ms: lastInputQueueMs,
-        last_playback_ack_ms: lastPlaybackAckMs, max_playback_ack_ms: maxPlaybackAckMs }));
+        last_playback_ack_ms: lastPlaybackAckMs, max_playback_ack_ms: maxPlaybackAckMs,
+        delegation_count: delegationCount, response_gap_ms: responseGaps,
+        call_end_requested: endCallSucceeded }));
       try {
         const result = await report(payload);
         (result?.ok ? logger.info : logger.error).call(logger,
@@ -235,9 +309,10 @@ export function createBridge({
     }
     function finish(reason, drain = true) {
       if (ending) return;
-      ending = true; endedAt = Date.now(); endingReason = reason;
+      ending = true; endedAt = Date.now(); endingReason ||= reason;
       clearTimeout(setupTimer); clearTimeout(maxDurationTimer);
-      if (reason !== "twilio_stop" && reason !== "twilio_closed") uncertain = true;
+      clearTimeout(endCallTimer);
+      if (!["twilio_stop", "twilio_closed", "conversation_complete"].includes(reason)) uncertain = true;
       if (drain && ready && openaiWs?.readyState === WebSocket.OPEN) {
         if (live) { pumpLiveAudio(); return; }
         // Capture the last caller utterance after hang-up. Avoid committing less
@@ -259,6 +334,24 @@ export function createBridge({
         if (live) {
           if (msg.event_id && liveEventIds.has(msg.event_id)) return;
           if (msg.event_id) liveEventIds.add(msg.event_id);
+          if (msg.type === "session.delegation.created") delegationCount++;
+          if (msg.type === "response.event") {
+            if (msg.event?.type === "response.created") {
+              responseCallerVersions.set(msg.delegation_id, callerVersion);
+              responseTools.set(msg.delegation_id, []);
+            }
+            if (msg.event?.type === "response.output_item.done" && msg.event.item?.type === "function_call") {
+              responseTools.get(msg.delegation_id)?.push(msg);
+            }
+            if (msg.event?.type === "response.completed") {
+              let resultsSubmitted = false;
+              for (const tool of responseTools.get(msg.delegation_id) || []) {
+                resultsSubmitted = handleEndCall(tool) || resultsSubmitted;
+              }
+              if (resultsSubmitted) send(openaiWs, { type: "response.create" });
+              responseTools.delete(msg.delegation_id);
+            }
+          }
           if (msg.type === "session.started" && !ready && !ending) {
             ready = true; clearTimeout(setupTimer);
             startupMs = Date.now() - startedAt;
@@ -278,6 +371,19 @@ export function createBridge({
               delegation_id: null, content: "Begin the conversation now, following the greeting instructions." });
           }
           if (["session.input_transcript.delta", "session.output_transcript.delta"].includes(msg.type) && typeof msg.delta === "string") {
+            if (msg.delta.trim() && msg.type === "session.input_transcript.delta") {
+              callerVersion++;
+              if (Number.isFinite(msg.end_ms)) lastCallerEndMs = msg.end_ms;
+              if (endCallTimer) {
+                clearTimeout(endCallTimer); endCallTimer = null; endCallPending = false;
+                send(openaiWs, { type: "session.instructions.append", delegation_id: null,
+                  content: "The caller continued speaking, so the scheduled hangup is cancelled. Listen and address what they are adding. End only after a fresh confirmation." });
+              }
+            } else if (msg.delta.trim() && msg.type === "session.output_transcript.delta" &&
+                lastCallerEndMs !== null && Number.isFinite(msg.start_ms) && msg.start_ms >= lastCallerEndMs) {
+              if (responseGaps.length < 100) responseGaps.push(Math.round(msg.start_ms - lastCallerEndMs));
+              lastCallerEndMs = null;
+            }
             liveFragments.push({ role: msg.type === "session.input_transcript.delta" ? "Caller" : "Assistant",
               text: msg.delta, start: Number.isFinite(msg.start_ms) ? msg.start_ms : Date.now() - startedAt,
               end: Number.isFinite(msg.end_ms) ? msg.end_ms : Date.now() - startedAt, order: liveFragments.length });

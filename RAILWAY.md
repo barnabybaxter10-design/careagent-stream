@@ -8,12 +8,13 @@ This service connects Twilio Media Streams to GPT-Live and posts completed call 
 - `OPENAI_VOICE_API`: `live` (default). Set `realtime` explicitly to roll back to the previous protocol; there is no silent model fallback.
 - `OPENAI_LIVE_MODEL`: `gpt-live-1` (default).
 - `OPENAI_LIVE_BACKEND_MODEL`: `gpt-5.6-luna` (default), used for Responses delegation of agency rules and urgency guidance.
-- `OPENAI_LIVE_VOICE`: `marin` (default).
+- `OPENAI_LIVE_VOICE`: `vesper` (default), OpenAI's British-influenced voice. Instructions also request British English; accent fidelity still needs a phone test.
 - `OPENAI_REALTIME_MODEL`: legacy rollback model, currently `gpt-realtime-2025-08-28`; ignored in Live mode.
 - `CAREGENIE_SYSTEM_PROMPT`: existing triage instructions.
 - `CALL_REPORT_URL`: `https://careagentnew-production.up.railway.app/api/webhooks/calls/report`.
 - `CALL_REPORT_SECRET`: same value as the main app.
 - `TWILIO_AUTH_TOKEN`: the primary token for the Twilio account owning the phone numbers.
+- `TWILIO_ACCOUNT_SID`: that account's AC identifier, required in Live mode to end the current call.
 - `TWILIO_STREAM_WSS_URL`: `wss://careagent-stream-production.up.railway.app/stream`; defaults to Railway's public domain plus `/stream`.
 - Optional `OPENAI_VOICE` (ballad), `TRANSCRIPTION_MODEL` (whisper-1), and `PORT` (8080).
 
@@ -27,9 +28,13 @@ Live connects to `wss://api.openai.com/v1/live/sessions`, starts `gpt-live-1` in
 
 The audio clock uses cumulative sample deadlines so timer overhead does not add latency to every frame. Only leading startup frames containing exclusively the two digital-zero PCMU codes are trimmed; all nonzero samples and later pauses are preserved. Voice instructions avoid backend delegation for acknowledgments and simple clarifications. Delegated reasoning uses low effort and concise output.
 
-Content-free `live_session_end` metrics include startup/first-output timing, input queue duration and Twilio playback-mark acknowledgment delay. Playback acknowledgments include network transit and the marked audio duration, so they are diagnostics rather than pure model latency. No audio or transcript is logged. Real phone tests are still required to assess conversational responsiveness.
+Content-free `live_session_end` metrics include startup/first-output timing, input queue duration, Twilio playback-mark acknowledgment delay, delegation count and up to 100 caller-end/assistant-start transcript gaps. Transcript gaps can include backchannels and transcription timing; playback acknowledgments include network transit and the marked audio duration. These are diagnostics rather than pure model latency. No audio or transcript is logged. Real phone tests are still required to assess conversational responsiveness.
 
-Short voice instructions handle conversation and disclosure; the existing agency prompt is supplied to the delegated Responses backend. No private tools execute during the conversation. Explicit implementation instructions override legacy `save_call_report` claims: reporting and alert processing happen after hang-up, and the voice must not claim successful delivery. The main app remains responsible for classification and notification execution.
+The greeting is "Hello, you're through to CareGenie. How can I help?" It does not volunteer an AI introduction; the assistant must answer honestly if asked whether it is automated. Short voice instructions avoid repeated questions and acknowledgments, accept "this number" for callback, and ask about urgency once unless new information changes it. The existing agency prompt is supplied to the delegated Responses backend. Explicit implementation instructions override legacy `save_call_report` claims: reporting and alert processing happen after hang-up, and the voice must not claim successful delivery. The main app remains responsible for classification and notification execution.
+
+The only in-call tool is `end_call`. The backend may request it after an explicit goodbye or after the caller confirms they have nothing more to add at the end of intake. Silence, complaints, and mid-conversation thanks must not trigger it. The bridge waits for the completed Responses lifecycle, requires a quote matching the whole latest caller utterance, rejects a stale caller version and deduplicates tool calls. New caller transcript content during a 750 ms closing grace cancels the action. Recognition depends on model/transcript accuracy; a delayed transcript can arrive after a phone update is already in flight.
+
+On confirmation the bridge updates only the authenticated current Twilio Call resource with a fixed British `Polly.Brian` goodbye followed by `<Hangup/>`. The final phrase uses Twilio speech, so its voice differs from GPT-Live. Replacing TwiML avoids the main app's post-Stream fallback redirect; merely closing the WebSocket would wrongly forward a completed call. The five-second request does not follow redirects or retry an uncertain speech update. If rejected, the live conversation remains available and the caller is told they may hang up. Reports still finalize once, including late transcripts. The final Twilio-rendered phrase is not inserted into GPT-Live's transcript as if it was observed audio. `call_end_request` logs provider acceptance, not proof that the goodbye was heard.
 
 Caller and assistant transcript deltas are retained separately, deduplicated by event ID and grouped by their timestamps without trimming or inventing spaces. Backend response text is never treated as spoken transcript. On hang-up, queued caller audio drains, the bridge sends `session.close`, and final transcripts remain accepted until `session.closed` (15-second timeout). Transport loss, backend failure or incomplete finalization produces an urgent report. Usage snapshots are cumulative; logs record the final seconds rather than summing snapshots. Live recording storage is explicitly disabled. Realtime rollback retains the previous GA protocol and two-second transcript grace period.
 
