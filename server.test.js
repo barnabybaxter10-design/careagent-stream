@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { WebSocket } from "ws";
 import twilio from "twilio";
 import { createBridge, postCallReport, configFromEnv } from "./server.js";
-import { liveSessionStart, renderLiveTranscript } from "./live.js";
+import { liveSessionStart, renderLiveTranscript, isDigitalSilence, nextAudioDeadline } from "./live.js";
 
 const config = {
   apiKey: "local-test", model: "gpt-realtime-2025-08-28", prompt: "Local test instructions",
@@ -185,7 +185,7 @@ test("Live streams paced PCMU, handles greeting acknowledgment and final late tr
   const ws = await f.connect(), received = [];
   ws.on("message", raw => received.push(JSON.parse(raw)));
   ws.send(JSON.stringify(start));
-  const payload = Buffer.alloc(160, 255).toString("base64");
+  const payload = Buffer.alloc(160, 128).toString("base64");
   for (let i = 0; i < 3; i++) ws.send(JSON.stringify({ event: "media", media: { payload } }));
   await until(() => f.upstreams.length);
   const ai = f.upstreams[0]; ai.open();
@@ -246,4 +246,48 @@ test("Live late overlapping transcript fragments retain spaces and repeated word
     { role: "Caller", text: "No,", start: 0, end: 200, order: 2 },
     { role: "Caller", text: "More.", start: 5000, end: 5500, order: 3 },
   ]), "Caller: No, no\nAssistant: Okay.\nCaller: More.");
+});
+
+test("sample clock prevents cumulative timer drift and bounds catch-up after a stall", () => {
+  let deadline = nextAudioDeadline(null, 160, 0);
+  for (let i = 0; i < 1000; i++) {
+    const callbackTime = deadline + 2; // Every callback arrives two milliseconds late.
+    deadline = nextAudioDeadline(deadline, 160, callbackTime);
+  }
+  assert.equal(deadline, 20020, "two milliseconds of scheduler delay must not accumulate per frame");
+  assert.ok(nextAudioDeadline(deadline, 160, 30000) >= 29980, "no unbounded burst after a long stall");
+});
+
+test("only digital zero samples count as removable startup silence", () => {
+  assert.equal(isDigitalSilence(Buffer.from([255, 127, 255]).toString("base64")), true);
+  assert.equal(isDigitalSilence(Buffer.from([255, 254, 255]).toString("base64")), false, "preserve even very quiet nonzero samples");
+  assert.equal(isDigitalSilence(""), false);
+});
+
+test("startup silence is trimmed without dropping caller speech or later pauses", async t => {
+  const logs = [];
+  const f = await fixture(t, { config: liveConfig, liveCloseMs: 300,
+    logger: { info: line => logs.push(JSON.parse(line)), error() {} } });
+  const ws = await f.connect(), silence = Buffer.alloc(160, 255).toString("base64"), speech = Buffer.alloc(160, 254).toString("base64");
+  ws.send(JSON.stringify(start));
+  for (const payload of [silence, silence, speech, silence]) ws.send(JSON.stringify({ event: "media", media: { payload } }));
+  await until(() => f.upstreams.length);
+  const ai = f.upstreams[0]; ai.open(); ai.message({ type: "session.started" });
+  ai.message({ type: "session.instructions.appended", client_event_id: "care_greeting" });
+  await until(() => ai.sent.filter(e => e.type === "session.input_audio.append").length === 2);
+  assert.deepEqual(ai.sent.filter(e => e.type === "session.input_audio.append").map(e => e.audio), [speech, silence]);
+  const received = [];
+  ws.on("message", raw => received.push(JSON.parse(raw)));
+  ai.message({ type: "session.output_audio.delta", delta: Buffer.alloc(1600, 128).toString("base64") });
+  await until(() => received.some(e => e.event === "mark"));
+  ws.send(JSON.stringify({ event: "mark", mark: received.find(e => e.event === "mark").mark }));
+  ws.send(JSON.stringify({ event: "stop" }));
+  await until(() => ai.sent.some(e => e.type === "session.close"));
+  ai.message({ type: "session.closed", reason: "close_requested", usage: { seconds: 1 } });
+  await until(() => f.reports.length);
+  const metrics = logs.find(e => e.event === "live_session_end");
+  assert.equal(metrics.trimmed_startup_silence_ms, 40);
+  assert.equal(metrics.last_input_queue_ms, 0);
+  assert.ok(metrics.last_playback_ack_ms >= 0);
+  assert.ok(!JSON.stringify(metrics).includes(speech), "timing logs contain no audio or transcript");
 });
