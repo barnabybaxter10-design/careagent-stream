@@ -5,7 +5,7 @@ import { WebSocket } from "ws";
 import twilio from "twilio";
 import { createBridge, postCallReport, configFromEnv, endTwilioCall } from "./server.js";
 import { liveSessionStart, liveGreeting, renderLiveTranscript, isDigitalSilence, nextAudioDeadline,
-  validEndCallArguments } from "./live.js";
+  validEndCallArguments, greetingText } from "./live.js";
 
 const config = {
   apiKey: "local-test", model: "gpt-realtime-2025-08-28", prompt: "Local test instructions",
@@ -182,7 +182,7 @@ test("Live defaults preserve agency guidance without inventing tool execution", 
   assert.equal(session.audio.output.voice, "vesper");
   assert.equal(session.delegation.responses.tool_choice, "auto");
   assert.deepEqual(session.delegation.responses.tools.map(t => t.name), ["end_call"]);
-  assert.match(liveGreeting().content, /CareGenie. How can I help/);
+  assert.match(liveGreeting().content, /the out-of-hours service. How can I help/);
   assert.ok(!liveGreeting().content.includes("I’m an AI"));
   assert.match(session.instructions, /honestly explain/);
 });
@@ -399,4 +399,118 @@ test("Twilio goodbye request is scoped, bounded and cannot redirect credentials"
   assert.ok(!twiml.includes("Redirect"));
   await endTwilioCall({ callSid: "../../other-account" }, config, { fetchImpl: async () => { throw new Error("Must not fetch"); } });
   assert.equal(requests.length, 1);
+});
+
+const preparedMeta = { callSid: `CA${"a".repeat(32)}`, agency_id: "agency-a", from: "+447000000001",
+  to: "+447000000002", agency_name: "Vanguard Care" };
+const preparedStart = token => ({ ...start, start: { ...start.start, callSid: preparedMeta.callSid,
+  customParameters: { ...preparedMeta, preparation_token: token } } });
+const prepareRequest = (f, meta = preparedMeta, secret = config.reportSecret) => fetch(`http://${f.address}/calls/prepare`, {
+  method: "POST", headers: { "Content-Type": "application/json", "X-Call-Report-Secret": secret }, body: JSON.stringify(meta),
+});
+
+test("agency greetings are per-call, with a neutral fallback and honest identity", () => {
+  const first = liveSessionStart(liveConfig, { agency_name: "Vanguard Care" }).session;
+  const second = liveSessionStart(liveConfig, { agency_name: "Oak & Elm Care" }).session;
+  assert.match(first.instructions, /Vanguard Care/);
+  assert.match(first.delegation.responses.instructions, /Vanguard Care/);
+  assert.ok(!second.instructions.includes("Vanguard"));
+  assert.match(second.instructions, /Oak & Elm Care/);
+  assert.equal(greetingText({ agency_name: "Vanguard Care" }), "Hello, you’re through to Vanguard Care’s out-of-hours service. How can I help?");
+  assert.ok(!greetingText().includes("CareGenie"));
+  assert.match(first.instructions, /never claim to be human or a clinician/);
+});
+
+test("unauthorized or invalid preparation never opens OpenAI", async t => {
+  const f = await fixture(t, { config: liveConfig });
+  assert.equal((await prepareRequest(f, preparedMeta, "wrong")).status, 401);
+  assert.equal((await prepareRequest(f, { ...preparedMeta, callSid: "bad" })).status, 400);
+  assert.equal((await prepareRequest(f, { ...preparedMeta, to: "https://other.example" })).status, 400);
+  assert.equal(f.upstreams.length, 0);
+});
+
+test("preparing before Twilio media eliminates the startup queue and preserves the first audio", async t => {
+  const logs = [];
+  const f = await fixture(t, { config: liveConfig, preparationSetupMs: 200, preparationTtlMs: 500,
+    logger: { info: line => logs.push(JSON.parse(line)), error() {} } });
+  const request = prepareRequest(f);
+  await until(() => f.upstreams.length);
+  const ai = f.upstreams[0]; ai.open();
+  assert.match(ai.sent[0].session.instructions, /Vanguard Care/);
+  ai.message({ type: "session.started", event_id: "ready_before_phone" });
+  const token = (await (await request).json()).preparation_token;
+  assert.match(token, /^[A-Za-z0-9_-]{32}$/);
+  // A duplicate voice webhook must reuse the prepared connection.
+  assert.equal((await (await prepareRequest(f)).json()).preparation_token, token);
+  const ws = await f.connect(), speech = Buffer.alloc(160, 128).toString("base64");
+  ws.send(JSON.stringify(preparedStart(token)));
+  ws.send(JSON.stringify({ event: "media", media: { payload: speech } }));
+  await until(() => ai.sent.some(e => e.type === "session.input_audio.append"));
+  assert.equal(f.upstreams.length, 1);
+  assert.equal(ai.sent.filter(e => e.type === "session.start").length, 1);
+  assert.equal((await prepareRequest(f)).status, 409, "a retry after attachment cannot open another paid preparation");
+  assert.equal(ai.sent.find(e => e.type === "session.input_audio.append").audio, speech);
+  assert.match(ai.sent.find(e => e.event_id === "care_greeting").content, /Vanguard Care/);
+  ai.message({ type: "session.instructions.appended", client_event_id: "care_greeting" });
+  ai.message({ type: "session.input_transcript.delta", delta: "Hello", start_ms: 100, end_ms: 300 });
+  // A consumed ticket cannot open another paid session or interfere with this one.
+  const duplicate = await f.connect(), closed = once(duplicate, "close");
+  duplicate.send(JSON.stringify(preparedStart(token))); await closed;
+  assert.equal(f.upstreams.length, 1);
+  assert.equal(ws.readyState, WebSocket.OPEN);
+  ws.send(JSON.stringify({ event: "stop" }));
+  await until(() => ai.sent.some(e => e.type === "session.close"));
+  ai.message({ type: "session.closed", reason: "close_requested" });
+  await until(() => f.reports.length);
+  const metric = logs.find(e => e.event === "live_session_end");
+  assert.equal(metric.prepared_session, true);
+  assert.equal(metric.input_queue_at_ready_ms, 0);
+  assert.ok(metric.max_input_queue_ms <= 20);
+  assert.equal(f.reports[0].agency_id, preparedMeta.agency_id);
+});
+
+test("preparation cannot be claimed with another agency, destination or name", async t => {
+  const f = await fixture(t, { config: liveConfig, preparationSetupMs: 200, preparationTtlMs: 1000 });
+  const request = prepareRequest(f); await until(() => f.upstreams.length);
+  const ai = f.upstreams[0]; ai.open(); ai.message({ type: "session.started" });
+  const token = (await (await request).json()).preparation_token;
+  for (const mismatch of [{ agency_id: "agency-b" }, { to: "+447000000009" }, { agency_name: "Other Care" }]) {
+    const ws = await f.connect(), closed = once(ws, "close"), data = preparedStart(token);
+    Object.assign(data.start.customParameters, mismatch);
+    ws.send(JSON.stringify(data)); await closed;
+  }
+  assert.equal(f.upstreams.length, 1);
+  assert.equal(f.reports.length, 0);
+  assert.equal((await prepareRequest(f, { ...preparedMeta, agency_id: "agency-b" })).status, 409);
+});
+
+test("preparation failure retains the cold start path and its early caller audio", async t => {
+  const f = await fixture(t, { config: liveConfig, preparationSetupMs: 20 });
+  const request = prepareRequest(f); await until(() => f.upstreams.length);
+  const abandoned = f.upstreams[0];
+  assert.equal((await request).status, 503);
+  assert.equal(abandoned.readyState, WebSocket.CLOSED);
+  const ws = await f.connect(), speech = Buffer.alloc(160, 129).toString("base64");
+  ws.send(JSON.stringify(preparedStart(undefined)));
+  ws.send(JSON.stringify({ event: "media", media: { payload: speech } }));
+  await until(() => f.upstreams.length === 2);
+  const ai = f.upstreams[1]; ai.open(); ai.message({ type: "session.started" });
+  ai.message({ type: "session.instructions.appended", client_event_id: "care_greeting" });
+  await until(() => ai.sent.some(e => e.type === "session.input_audio.append"));
+  assert.equal(ai.sent.find(e => e.type === "session.input_audio.append").audio, speech);
+  ws.send(JSON.stringify({ event: "stop" }));
+  await until(() => ai.sent.some(e => e.type === "session.close"));
+  ai.message({ type: "session.closed", reason: "close_requested" });
+});
+
+test("unused preparations expire, close their paid session and cannot accumulate", async t => {
+  const f = await fixture(t, { config: liveConfig, preparationSetupMs: 100, preparationTtlMs: 25, preparationLimit: 1 });
+  const request = prepareRequest(f); await until(() => f.upstreams.length);
+  assert.equal((await prepareRequest(f, { ...preparedMeta, callSid: `CA${"b".repeat(32)}` })).status, 429);
+  const ai = f.upstreams[0]; ai.open(); ai.message({ type: "session.started" });
+  await request;
+  await until(() => ai.sent.some(e => e.type === "session.close"));
+  ai.message({ type: "session.closed", reason: "close_requested" });
+  assert.equal(ai.readyState, WebSocket.CLOSED);
+  assert.equal(f.reports.length, 0, "an unattached preparation is not a completed phone call");
 });

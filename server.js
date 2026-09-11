@@ -5,7 +5,9 @@ import { setTimeout as delay } from "node:timers/promises";
 import twilio from "twilio";
 import { WebSocketServer, WebSocket } from "ws";
 import { connectLive, liveSessionStart, liveGreeting, renderLiveTranscript,
-  isDigitalSilence, nextAudioDeadline, latestCallerUtterance, validEndCallArguments } from "./live.js";
+  isDigitalSilence, nextAudioDeadline, latestCallerUtterance, validEndCallArguments,
+  agencyName, agencyContext, greetingText } from "./live.js";
+import { createPreparedCalls, validPreparationSecret, preparationMetadata } from "./prepared.js";
 
 const send = (ws, value) => {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(value));
@@ -64,12 +66,12 @@ export function validHandshake(req, config) {
     twilio.validateRequest(config.twilioToken, signature, url, {}));
 }
 
-export function sessionUpdate(config) {
+export function sessionUpdate(config, meta = {}) {
   return {
     type: "session.update",
     session: {
       type: "realtime",
-      instructions: config.prompt,
+      instructions: `${config.prompt}\n\n${agencyContext(meta)}`,
       output_modalities: ["audio"],
       audio: {
         input: {
@@ -139,11 +141,45 @@ export function createBridge({
   setupMs = 10000,
   liveCloseMs = 15000,
   endCallGraceMs = 750,
+  preparationSetupMs = 4000,
+  preparationTtlMs = 20000,
+  preparationLimit = 16,
 } = {}) {
   const live = config.voiceApi === "live";
   const missing = missingConfiguration(config);
+  const preparedCalls = createPreparedCalls({ config, connectOpenAI, setupMs: preparationSetupMs,
+    ttlMs: preparationTtlMs, limit: preparationLimit });
+  async function prepareCall(req, res) {
+    const respond = (status, value) => {
+      if (res.destroyed) return;
+      res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(value));
+    };
+    if (!validPreparationSecret(req.headers["x-call-report-secret"], config.reportSecret)) {
+      req.resume(); respond(401, { error: "Unauthorized" }); return;
+    }
+    if (!live || missing.length) { req.resume(); respond(503, { error: "Voice preparation unavailable" }); return; }
+    let bytes = 0, chunks = [];
+    req.setTimeout(1500, () => req.destroy());
+    try {
+      for await (const chunk of req) {
+        bytes += chunk.length;
+        if (bytes > 8192) { respond(413, { error: "Request too large" }); return; }
+        chunks.push(chunk);
+      }
+      req.setTimeout(0);
+      let body;
+      try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { respond(400, { error: "Invalid metadata" }); return; }
+      const meta = preparationMetadata(body);
+      if (!meta) { respond(400, { error: "Invalid metadata" }); return; }
+      respond(200, await preparedCalls.prepare(meta));
+    } catch (error) { respond(error.status || 503, { error: "Voice preparation unavailable" }); }
+    finally { req.setTimeout(0); }
+  }
   const server = http.createServer((req, res) => {
-    if (req.url === "/health" || req.url === "/ready") {
+    if (req.method === "POST" && req.url === "/calls/prepare") {
+      void prepareCall(req, res);
+    } else if (req.url === "/health" || req.url === "/ready") {
       res.writeHead(req.url === "/ready" && missing.length ? 503 : 200,
         { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", ready: missing.length === 0, missing,
@@ -153,6 +189,7 @@ export function createBridge({
       res.writeHead(404); res.end();
     }
   });
+  server.on("close", () => preparedCalls.close());
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
   server.on("upgrade", (req, socket, head) => {
     const status = missing.length ? 503 : validHandshake(req, config) ? 101 : 403;
@@ -172,6 +209,7 @@ export function createBridge({
     let endingReason, liveFinalized = false, closeRequested = false, greetingAccepted = false;
     let usageSeconds = null;
     let nextAudioAt = null, startupMs = null, firstOutputMs = null, trimmedSilenceMs = 0;
+    let preparationMs = null, inputQueueAtReadyMs = null;
     let maxInputQueueMs = 0, lastInputQueueMs = 0, outputSinceMark = 0, markSequence = 0;
     let lastPlaybackAckMs = null, maxPlaybackAckMs = 0;
     let callerVersion = 0, endCallTimer, endCallPending = false, endCallSucceeded = false;
@@ -295,6 +333,7 @@ export function createBridge({
       if (live) logger.info(JSON.stringify({ event: "live_session_end", callSid: meta.callSid,
         finalized: liveFinalized, usage_seconds: usageSeconds, startup_ms: startupMs,
         first_output_ms: firstOutputMs, trimmed_startup_silence_ms: trimmedSilenceMs,
+        prepared_session: preparationMs !== null, preparation_ms: preparationMs, input_queue_at_ready_ms: inputQueueAtReadyMs,
         max_input_queue_ms: maxInputQueueMs, last_input_queue_ms: lastInputQueueMs,
         last_playback_ack_ms: lastPlaybackAckMs, max_playback_ack_ms: maxPlaybackAckMs,
         delegation_count: delegationCount, response_gap_ms: responseGaps,
@@ -323,11 +362,12 @@ export function createBridge({
     }
     setupTimer = setTimeout(() => finish("start_timeout", false), setupMs);
 
-    function startOpenAI() {
-      try { openaiWs = connectOpenAI(); }
+    function startOpenAI(prepared) {
+      try { openaiWs = prepared?.ws || connectOpenAI(); }
       catch { finish("openai_connect_error", false); return; }
-      openaiWs.on("open", () => send(openaiWs, live ? liveSessionStart(config) : sessionUpdate(config)));
-      openaiWs.on("message", raw => {
+      if (prepared) preparationMs = prepared.setupTimeMs;
+      else openaiWs.on("open", () => send(openaiWs, live ? liveSessionStart(config, meta) : sessionUpdate(config, meta)));
+      const onOpenAIMessage = raw => {
         let msg;
         try { msg = JSON.parse(raw.toString()); } catch { return; }
         if (reported) return;
@@ -355,13 +395,14 @@ export function createBridge({
           if (msg.type === "session.started" && !ready && !ending) {
             ready = true; clearTimeout(setupTimer);
             startupMs = Date.now() - startedAt;
+            inputQueueAtReadyMs = queuedBytes / 8;
             // Retaining old startup silence makes every later utterance late.
             // Preserve all non-silent audio and one final frame to keep input flowing.
             while (audioQueue.length > 1 && isDigitalSilence(audioQueue[0])) {
               const bytes = Buffer.from(audioQueue.shift(), "base64").length;
               queuedBytes -= bytes; trimmedSilenceMs += bytes / 8;
             }
-            send(openaiWs, liveGreeting());
+            send(openaiWs, liveGreeting(meta));
             setupTimer = setTimeout(() => finish("live_greeting_timeout", false), setupMs);
             pumpLiveAudio();
           }
@@ -422,7 +463,7 @@ export function createBridge({
           ready = true; clearTimeout(setupTimer);
           send(openaiWs, { type: "response.create", response: {
             output_modalities: ["audio"],
-            instructions: "Greet the caller briefly and ask how you can help. Keep it calm and professional.",
+            instructions: `Greet the caller with: ${JSON.stringify(greetingText(meta))} Then listen.`,
           } });
           for (const payload of audioQueue) appendAudio(payload);
           audioQueue = []; queuedBytes = 0;
@@ -454,7 +495,8 @@ export function createBridge({
           logger.error(JSON.stringify({ event: "openai_error", code: msg.error?.code || "unknown" }));
           finish("openai_error", false);
         }
-      });
+      };
+      openaiWs.on("message", onOpenAIMessage);
       openaiWs.on("close", () => {
         ready = false;
         if (live && !liveFinalized) uncertain = true;
@@ -462,6 +504,7 @@ export function createBridge({
         else finish("openai_closed", false);
       });
       openaiWs.on("error", () => finish("openai_error", false));
+      if (prepared) for (const raw of prepared.events) onOpenAIMessage(raw);
     }
 
     twilioWs.on("message", raw => {
@@ -482,12 +525,16 @@ export function createBridge({
             start.mediaFormat?.sampleRate !== 8000 || start.mediaFormat?.channels !== 1) {
           finish("invalid_start", false); return;
         }
-        meta = { agency_id: params.agency_id, callSid: start.callSid, from: params.from || "", to: params.to };
+        const candidateMeta = { agency_id: params.agency_id, callSid: start.callSid, from: params.from || "", to: params.to,
+          agency_name: agencyName(params.agency_name) };
+        const prepared = live && params.preparation_token ? preparedCalls.claim(params.preparation_token, candidateMeta) : null;
+        if (prepared?.status === "invalid") { finish("invalid_preparation", false); return; }
+        meta = candidateMeta;
         streamSid = start.streamSid; startedAt = Date.now();
         clearTimeout(setupTimer);
         setupTimer = setTimeout(() => finish("openai_setup_timeout", false), setupMs);
         maxDurationTimer = setTimeout(() => finish("duration_limit"), 55 * 60 * 1000);
-        startOpenAI();
+        startOpenAI(prepared?.status === "claimed" ? prepared : null);
       } else if (msg.event === "media" && meta && typeof msg.media?.payload === "string") {
         if (ready) appendAudio(msg.media.payload);
         else {
